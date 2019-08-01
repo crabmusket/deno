@@ -126,7 +126,8 @@ mod tests {
       argv,
       op_selector_std,
       Progress::new(),
-    );
+    )
+    .unwrap();
     let state_ = state.clone();
     tokio_util::run(lazy(move || {
       let mut worker =
@@ -154,7 +155,8 @@ mod tests {
       argv,
       op_selector_std,
       Progress::new(),
-    );
+    )
+    .unwrap();
     let state_ = state.clone();
     tokio_util::run(lazy(move || {
       let mut worker =
@@ -180,7 +182,8 @@ mod tests {
     let mut flags = flags::DenoFlags::default();
     flags.reload = true;
     let state =
-      ThreadSafeState::new(flags, argv, op_selector_std, Progress::new());
+      ThreadSafeState::new(flags, argv, op_selector_std, Progress::new())
+        .unwrap();
     let state_ = state.clone();
     tokio_util::run(lazy(move || {
       let mut worker = Worker::new(
@@ -282,7 +285,8 @@ mod tests {
           println!("workers.rs after resource close");
           r.unwrap();
           Ok(())
-        }).shared();
+        })
+        .shared();
 
       let worker_future_ = worker_future.clone();
       tokio::spawn(lazy(move || worker_future_.then(|_| Ok(()))));

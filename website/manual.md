@@ -599,27 +599,26 @@ Use `deno help` to see the help text.
 
 ```
 USAGE:
-    deno [FLAGS] [OPTIONS] [SUBCOMMAND]
-
-FLAGS:
-    -A, --allow-all       Allow all permissions
-        --allow-env       Allow environment access
-        --allow-hrtime    Allow high resolution time measurement
-        --allow-run       Allow running subprocesses
-    -h, --help            Prints help information
-        --no-prompt       Do not use prompts
-    -r, --reload          Reload source code cache (recompile TypeScript)
-        --v8-options      Print V8 command line options
+    deno [OPTIONS] [SUBCOMMAND]
 
 OPTIONS:
+    -A, --allow-all                    Allow all permissions
+        --allow-env                    Allow environment access
+        --allow-hrtime                 Allow high resolution time measurement
         --allow-net=<allow-net>        Allow network access
         --allow-read=<allow-read>      Allow file system read access
+        --allow-run                    Allow running subprocesses
         --allow-write=<allow-write>    Allow file system write access
     -c, --config <FILE>                Load compiler configuration file
+    -h, --help                         Prints help information
         --importmap <FILE>             Load import map file
     -L, --log-level <log-level>        Set log level [possible values: debug, info]
+        --no-fetch                     Do not download remote modules
+        --no-prompt                    Do not use prompts
+    -r, --reload                       Reload source code cache (recompile TypeScript)
         --seed <NUMBER>                Seed Math.random()
         --v8-flags=<v8-flags>          Set V8 command line options
+        --v8-options                   Print V8 command line options
 
 SUBCOMMANDS:
     [SCRIPT]       Script to run
@@ -776,7 +775,7 @@ tabs.
 
 It is a good practice to use `import.meta.main` idiom for an entry point for
 executable file. See
-[Testing if current file is the main program](#testing-if-current-file-is-the-main-program)
+[Testing if current file is the main program](#testingifcurrentfileisthemainprogram)
 section.
 
 Example:

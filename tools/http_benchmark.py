@@ -32,6 +32,16 @@ def deno_tcp(deno_exe):
     return run(deno_cmd, addr)
 
 
+def deno_tcp_current_thread(deno_exe):
+    addr = get_addr()
+    deno_cmd = [
+        deno_exe, "run", "--current-thread", "--allow-net",
+        "tools/deno_tcp.ts", addr
+    ]
+    print "http_benchmark testing DENO."
+    return run(deno_cmd, addr)
+
+
 def deno_http(deno_exe):
     addr = get_addr()
     deno_cmd = [
@@ -146,6 +156,7 @@ def http_benchmark(build_dir):
     return {
         # "deno_tcp" was once called "deno"
         "deno_tcp": deno_tcp(deno_exe),
+        "deno_tcp_current_thread": deno_tcp_current_thread(deno_exe),
         # "deno_http" was once called "deno_net_http"
         "deno_http": deno_http(deno_exe),
         "deno_proxy": deno_http_proxy(deno_exe, hyper_hello_exe),
@@ -184,8 +195,8 @@ def run(server_cmd, addr, merge_env=None, origin_cmd=None):
     time.sleep(10)  # wait for server to wake up. TODO racy.
 
     try:
-        cmd = "third_party/wrk/%s/wrk -d %s http://%s/" % (util.platform(),
-                                                           DURATION, addr)
+        cmd = "third_party/wrk/%s/wrk -d %s --latency http://%s/" % (
+            util.platform(), DURATION, addr)
         print cmd
         output = subprocess.check_output(cmd, shell=True)
         stats = util.parse_wrk_output(output)

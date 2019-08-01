@@ -1,7 +1,5 @@
 // Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
-use atty;
 use crate::ansi;
-use crate::deno_dir::SourceFileFetcher;
 use crate::deno_error;
 use crate::deno_error::DenoError;
 use crate::deno_error::ErrorKind;
@@ -20,12 +18,15 @@ use crate::resources;
 use crate::resources::table_entries;
 use crate::resources::Resource;
 use crate::signal::kill;
+use crate::source_maps::get_orig_position;
+use crate::source_maps::CachedMaps;
 use crate::startup_data;
 use crate::state::ThreadSafeState;
 use crate::tokio_util;
 use crate::tokio_write;
 use crate::version;
 use crate::worker::Worker;
+use atty;
 use deno::Buf;
 use deno::CoreOp;
 use deno::ErrBox;
@@ -46,6 +47,7 @@ use log;
 use rand::{thread_rng, Rng};
 use remove_dir_all::remove_dir_all;
 use std;
+use std::collections::HashMap;
 use std::convert::From;
 use std::fs;
 use std::net::Shutdown;
@@ -67,9 +69,11 @@ use std::os::unix::process::ExitStatusExt;
 
 type CliOpResult = OpResult<ErrBox>;
 
-type CliDispatchFn =
-  fn(state: &ThreadSafeState, base: &msg::Base<'_>, data: Option<PinnedBuf>)
-    -> CliOpResult;
+type CliDispatchFn = fn(
+  state: &ThreadSafeState,
+  base: &msg::Base<'_>,
+  data: Option<PinnedBuf>,
+) -> CliOpResult;
 
 pub type OpSelector = fn(inner_type: msg::Any) -> Option<CliDispatchFn>;
 
@@ -132,40 +136,43 @@ pub fn dispatch_all_legacy(
     }
     Ok(Op::Async(fut)) => {
       let result_fut = Box::new(
-        fut.or_else(move |err: ErrBox| -> Result<Buf, ()> {
-          debug!("op err {}", err);
-          // No matter whether we got an Err or Ok, we want a serialized message to
-          // send back. So transform the DenoError into a Buf.
-          let builder = &mut FlatBufferBuilder::new();
-          let errmsg_offset = builder.create_string(&format!("{}", err));
-          Ok(serialize_response(
-            cmd_id,
-            builder,
-            msg::BaseArgs {
-              error: Some(errmsg_offset),
-              error_kind: err.kind(),
-              ..Default::default()
-            },
-          ))
-        }).and_then(move |buf: Buf| -> Result<Buf, ()> {
-          // Handle empty responses. For sync responses we just want
-          // to send null. For async we want to send a small message
-          // with the cmd_id.
-          let buf = if buf.len() > 0 {
-            buf
-          } else {
+        fut
+          .or_else(move |err: ErrBox| -> Result<Buf, ()> {
+            debug!("op err {}", err);
+            // No matter whether we got an Err or Ok, we want a serialized message to
+            // send back. So transform the DenoError into a Buf.
             let builder = &mut FlatBufferBuilder::new();
-            serialize_response(
+            let errmsg_offset = builder.create_string(&format!("{}", err));
+            Ok(serialize_response(
               cmd_id,
               builder,
               msg::BaseArgs {
+                error: Some(errmsg_offset),
+                error_kind: err.kind(),
                 ..Default::default()
               },
-            )
-          };
-          state.metrics_op_completed(buf.len());
-          Ok(buf)
-        }).map_err(|err| panic!("unexpected error {:?}", err)),
+            ))
+          })
+          .and_then(move |buf: Buf| -> Result<Buf, ()> {
+            // Handle empty responses. For sync responses we just want
+            // to send null. For async we want to send a small message
+            // with the cmd_id.
+            let buf = if buf.len() > 0 {
+              buf
+            } else {
+              let builder = &mut FlatBufferBuilder::new();
+              serialize_response(
+                cmd_id,
+                builder,
+                msg::BaseArgs {
+                  ..Default::default()
+                },
+              )
+            };
+            state.metrics_op_completed(buf.len());
+            Ok(buf)
+          })
+          .map_err(|err| panic!("unexpected error {:?}", err)),
       );
       Op::Async(result_fut)
     }
@@ -194,6 +201,7 @@ pub fn dispatch_all_legacy(
 pub fn op_selector_std(inner_type: msg::Any) -> Option<CliDispatchFn> {
   match inner_type {
     msg::Any::Accept => Some(op_accept),
+    msg::Any::ApplySourceMap => Some(op_apply_source_map),
     msg::Any::Cache => Some(op_cache),
     msg::Any::Chdir => Some(op_chdir),
     msg::Any::Chmod => Some(op_chmod),
@@ -502,7 +510,7 @@ fn op_fetch_source_file(
   let resolved_specifier = state.resolve(specifier, referrer, false)?;
 
   let fut = state
-    .dir
+    .file_fetcher
     .fetch_source_file_async(&resolved_specifier)
     .and_then(move |out| {
       let builder = &mut FlatBufferBuilder::new();
@@ -530,6 +538,48 @@ fn op_fetch_source_file(
   // out of threads in the main runtime.
   let result_buf = tokio_util::block_on(fut)?;
   Ok(Op::Sync(result_buf))
+}
+
+fn op_apply_source_map(
+  state: &ThreadSafeState,
+  base: &msg::Base<'_>,
+  data: Option<PinnedBuf>,
+) -> CliOpResult {
+  if !base.sync() {
+    return Err(deno_error::no_async_support());
+  }
+  assert!(data.is_none());
+  let inner = base.inner_as_apply_source_map().unwrap();
+  let cmd_id = base.cmd_id();
+  let filename = inner.filename().unwrap();
+  let line = inner.line();
+  let column = inner.column();
+
+  let mut mappings_map: CachedMaps = HashMap::new();
+  let (orig_filename, orig_line, orig_column) = get_orig_position(
+    filename.to_owned(),
+    line.into(),
+    column.into(),
+    &mut mappings_map,
+    &state.ts_compiler,
+  );
+
+  let builder = &mut FlatBufferBuilder::new();
+  let msg_args = msg::ApplySourceMapArgs {
+    filename: Some(builder.create_string(&orig_filename)),
+    line: orig_line as i32,
+    column: orig_column as i32,
+  };
+  let res_inner = msg::ApplySourceMap::create(builder, &msg_args);
+  ok_buf(serialize_response(
+    cmd_id,
+    builder,
+    msg::BaseArgs {
+      inner: Some(res_inner.as_union_value()),
+      inner_type: msg::Any::ApplySourceMap,
+      ..Default::default()
+    },
+  ))
 }
 
 fn op_chdir(
@@ -1333,7 +1383,8 @@ fn op_read_dir(
             has_mode: cfg!(target_family = "unix"),
           },
         )
-      }).collect();
+      })
+      .collect();
 
     let entries = builder.create_vector(&entries);
     let inner = msg::ReadDirRes::create(
@@ -1750,7 +1801,8 @@ fn op_resources(
           repr: Some(repr),
         },
       )
-    }).collect();
+    })
+    .collect();
 
   let resources = builder.create_vector(&res);
   let inner = msg::ResourcesRes::create(
@@ -2018,7 +2070,7 @@ fn op_create_worker(
     parent_state.argv.clone(),
     op_selector_std,
     parent_state.progress.clone(),
-  );
+  )?;
   let rid = child_state.resource.rid;
   let name = format!("USER-WORKER-{}", specifier);
 

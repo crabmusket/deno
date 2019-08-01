@@ -1,11 +1,14 @@
 // Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
-use crate::compiler::TsCompiler;
+use crate::compilers::CompiledModule;
+use crate::compilers::JsCompiler;
+use crate::compilers::JsonCompiler;
+use crate::compilers::TsCompiler;
 use crate::deno_dir;
-use crate::deno_dir::SourceFile;
-use crate::deno_dir::SourceFileFetcher;
+use crate::file_fetcher::SourceFileFetcher;
 use crate::flags;
 use crate::global_timer::GlobalTimer;
 use crate::import_map::ImportMap;
+use crate::msg;
 use crate::ops;
 use crate::permissions::DenoPermissions;
 use crate::progress::Progress;
@@ -26,6 +29,7 @@ use std;
 use std::collections::HashMap;
 use std::env;
 use std::ops::Deref;
+use std::str;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -76,6 +80,9 @@ pub struct State {
   pub progress: Progress,
   pub seeded_rng: Option<Mutex<StdRng>>,
 
+  pub file_fetcher: SourceFileFetcher,
+  pub js_compiler: JsCompiler,
+  pub json_compiler: JsonCompiler,
   pub ts_compiler: TsCompiler,
 }
 
@@ -100,28 +107,6 @@ impl ThreadSafeState {
   ) -> CoreOp {
     ops::dispatch_all(self, control, zero_copy, self.dispatch_selector)
   }
-}
-
-pub fn fetch_source_file_and_maybe_compile_async(
-  state: &ThreadSafeState,
-  module_specifier: &ModuleSpecifier,
-) -> impl Future<Item = SourceFile, Error = ErrBox> {
-  let state_ = state.clone();
-
-  state_
-    .dir
-    .fetch_source_file_async(&module_specifier)
-    .and_then(move |out| {
-      state_
-        .clone()
-        .ts_compiler
-        .compile_async(state_.clone(), &out)
-        .map_err(|e| {
-          debug!("compiler error exiting!");
-          eprintln!("\n{}", e.to_string());
-          std::process::exit(1);
-        })
-    })
 }
 
 impl Loader for ThreadSafeState {
@@ -149,16 +134,14 @@ impl Loader for ThreadSafeState {
     module_specifier: &ModuleSpecifier,
   ) -> Box<deno::SourceCodeInfoFuture> {
     self.metrics.resolve_count.fetch_add(1, Ordering::SeqCst);
-    Box::new(
-      fetch_source_file_and_maybe_compile_async(self, module_specifier).map(
-        |source_file| deno::SourceCodeInfo {
-          // Real module name, might be different from initial specifier
-          // due to redirections.
-          code: source_file.js_source(),
-          module_name: source_file.url.to_string(),
-        },
-      ),
-    )
+    Box::new(self.fetch_compiled_module(module_specifier).map(
+      |compiled_module| deno::SourceCodeInfo {
+        // Real module name, might be different from initial specifier
+        // due to redirections.
+        code: compiled_module.code,
+        module_name: compiled_module.name,
+      },
+    ))
   }
 }
 
@@ -168,7 +151,7 @@ impl ThreadSafeState {
     argv_rest: Vec<String>,
     dispatch_selector: ops::OpSelector,
     progress: Progress,
-  ) -> Self {
+  ) -> Result<Self, ErrBox> {
     let custom_root = env::var("DENO_DIR").map(String::into).ok();
 
     let (worker_in_tx, worker_in_rx) = async_mpsc::channel::<Buf>(1);
@@ -177,41 +160,40 @@ impl ThreadSafeState {
     let external_channels = (worker_in_tx, worker_out_rx);
     let resource = resources::add_worker(external_channels);
 
-    let dir = deno_dir::DenoDir::new(
-      custom_root,
+    let dir = deno_dir::DenoDir::new(custom_root)?;
+
+    let file_fetcher = SourceFileFetcher::new(
+      dir.deps_cache.clone(),
       progress.clone(),
       !flags.reload,
       flags.no_fetch,
-    ).unwrap();
+    )?;
+
+    let ts_compiler = TsCompiler::new(
+      file_fetcher.clone(),
+      dir.gen_cache.clone(),
+      !flags.reload,
+      flags.config_path.clone(),
+    )?;
 
     let main_module: Option<ModuleSpecifier> = if argv_rest.len() <= 1 {
       None
     } else {
       let root_specifier = argv_rest[1].clone();
-      match ModuleSpecifier::resolve_url_or_path(&root_specifier) {
-        Ok(specifier) => Some(specifier),
-        Err(e) => {
-          // TODO: handle unresolvable specifier
-          panic!("Unable to resolve root specifier: {:?}", e);
-        }
-      }
+      Some(ModuleSpecifier::resolve_url_or_path(&root_specifier)?)
     };
 
-    let mut import_map = None;
-    if let Some(file_name) = &flags.import_map_path {
-      let base_url = match &main_module {
-        Some(module_specifier) => module_specifier.clone(),
-        None => unreachable!(),
-      };
-
-      match ImportMap::load(&base_url.to_string(), file_name) {
-        Ok(map) => import_map = Some(map),
-        Err(err) => {
-          println!("{:?}", err);
-          panic!("Error parsing import map");
-        }
+    let import_map: Option<ImportMap> = match &flags.import_map_path {
+      None => None,
+      Some(file_name) => {
+        let base_url = match &main_module {
+          Some(module_specifier) => module_specifier.clone(),
+          None => unreachable!(),
+        };
+        let import_map = ImportMap::load(&base_url.to_string(), file_name)?;
+        Some(import_map)
       }
-    }
+    };
 
     let mut seeded_rng = None;
     if let Some(seed) = flags.seed {
@@ -220,10 +202,7 @@ impl ThreadSafeState {
 
     let modules = Arc::new(Mutex::new(deno::Modules::new()));
 
-    let ts_compiler =
-      TsCompiler::new(dir.clone(), !flags.reload, flags.config_path.clone());
-
-    ThreadSafeState(Arc::new(State {
+    let state = State {
       main_module,
       modules,
       dir,
@@ -240,8 +219,42 @@ impl ThreadSafeState {
       dispatch_selector,
       progress,
       seeded_rng,
+      file_fetcher,
       ts_compiler,
-    }))
+      js_compiler: JsCompiler {},
+      json_compiler: JsonCompiler {},
+    };
+
+    Ok(ThreadSafeState(Arc::new(state)))
+  }
+
+  pub fn fetch_compiled_module(
+    self: &Self,
+    module_specifier: &ModuleSpecifier,
+  ) -> impl Future<Item = CompiledModule, Error = ErrBox> {
+    let state_ = self.clone();
+
+    self
+      .file_fetcher
+      .fetch_source_file_async(&module_specifier)
+      .and_then(move |out| match out.media_type {
+        msg::MediaType::Unknown => {
+          state_.js_compiler.compile_async(state_.clone(), &out)
+        }
+        msg::MediaType::Json => {
+          state_.json_compiler.compile_async(state_.clone(), &out)
+        }
+        msg::MediaType::TypeScript => {
+          state_.ts_compiler.compile_async(state_.clone(), &out)
+        }
+        msg::MediaType::JavaScript => {
+          if state_.ts_compiler.compile_js {
+            state_.ts_compiler.compile_async(state_.clone(), &out)
+          } else {
+            state_.js_compiler.compile_async(state_.clone(), &out)
+          }
+        }
+      })
   }
 
   /// Read main module from argv
@@ -290,6 +303,7 @@ impl ThreadSafeState {
       ops::op_selector_std,
       Progress::new(),
     )
+    .unwrap()
   }
 
   pub fn metrics_op_dispatched(

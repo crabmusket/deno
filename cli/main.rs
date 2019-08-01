@@ -16,12 +16,13 @@ extern crate rand;
 extern crate url;
 
 mod ansi;
-pub mod compiler;
+pub mod compilers;
 pub mod deno_dir;
 pub mod deno_error;
 pub mod diagnostics;
 mod disk_cache;
 mod dispatch_minimal;
+mod file_fetcher;
 pub mod flags;
 pub mod fmt_errors;
 mod fs;
@@ -47,7 +48,6 @@ mod tokio_write;
 pub mod version;
 pub mod worker;
 
-use crate::deno_dir::SourceFileFetcher;
 use crate::progress::Progress;
 use crate::state::ThreadSafeState;
 use crate::worker::Worker;
@@ -99,6 +99,7 @@ fn js_check(r: Result<(), ErrBox>) {
   }
 }
 
+// TODO: we might want to rethink how this method works
 pub fn print_file_info(
   worker: Worker,
   module_specifier: &ModuleSpecifier,
@@ -107,10 +108,10 @@ pub fn print_file_info(
   let module_specifier_ = module_specifier.clone();
 
   state_
-    .dir
+    .file_fetcher
     .fetch_source_file_async(&module_specifier)
     .map_err(|err| println!("{}", err))
-    .and_then(move |out| {
+    .and_then(|out| {
       println!(
         "{} {}",
         ansi::bold("local:".to_string()),
@@ -125,18 +126,26 @@ pub fn print_file_info(
 
       state_
         .clone()
-        .ts_compiler
-        .compile_async(state_.clone(), &out)
+        .fetch_compiled_module(&module_specifier_)
         .map_err(|e| {
           debug!("compiler error exiting!");
           eprintln!("\n{}", e.to_string());
           std::process::exit(1);
-        }).and_then(move |compiled| {
-          if out.media_type == msg::MediaType::TypeScript {
+        })
+        .and_then(move |compiled| {
+          if out.media_type == msg::MediaType::TypeScript
+            || (out.media_type == msg::MediaType::JavaScript
+              && state_.ts_compiler.compile_js)
+          {
+            let compiled_source_file = state_
+              .ts_compiler
+              .get_compiled_source_file(&out.url)
+              .unwrap();
+
             println!(
               "{} {}",
               ansi::bold("compiled:".to_string()),
-              compiled.filename.to_str().unwrap(),
+              compiled_source_file.filename.to_str().unwrap(),
             );
           }
 
@@ -152,12 +161,8 @@ pub fn print_file_info(
             );
           }
 
-          if let Some(deps) = worker
-            .state
-            .modules
-            .lock()
-            .unwrap()
-            .deps(&compiled.url.to_string())
+          if let Some(deps) =
+            worker.state.modules.lock().unwrap().deps(&compiled.name)
           {
             println!("{}{}", ansi::bold("deps:\n".to_string()), deps.name);
             if let Some(ref depsdeps) = deps.deps {
@@ -191,7 +196,8 @@ fn create_worker_and_state(
       s.status(status, msg).expect("shell problem");
     }
   });
-  let state = ThreadSafeState::new(flags, argv, ops::op_selector_std, progress);
+  let state =
+    ThreadSafeState::new(flags, argv, ops::op_selector_std, progress).unwrap();
   let worker = Worker::new(
     "main".to_string(),
     startup_data::deno_isolate_init(),
@@ -231,7 +237,8 @@ fn fetch_or_info_command(
         } else {
           future::Either::B(future::ok(worker))
         }
-      }).and_then(|worker| {
+      })
+      .and_then(|worker| {
         worker.then(|result| {
           js_check(result);
           Ok(())
@@ -285,7 +292,8 @@ fn xeval_command(flags: DenoFlags, argv: Vec<String>) {
       .then(|result| {
         js_check(result);
         Ok(())
-      }).map_err(print_err_and_exit)
+      })
+      .map_err(print_err_and_exit)
   });
   tokio_util::run(main_future);
 }
@@ -304,7 +312,8 @@ fn bundle_command(flags: DenoFlags, argv: Vec<String>) {
       debug!("diagnostics returned, exiting!");
       eprintln!("");
       print_err_and_exit(err);
-    }).and_then(move |_| {
+    })
+    .and_then(move |_| {
       debug!(">>>>> bundle_async END");
       Ok(())
     });
@@ -322,12 +331,14 @@ fn run_repl(flags: DenoFlags, argv: Vec<String>) {
       .then(|result| {
         js_check(result);
         Ok(())
-      }).map_err(|(err, _worker): (ErrBox, Worker)| print_err_and_exit(err))
+      })
+      .map_err(|(err, _worker): (ErrBox, Worker)| print_err_and_exit(err))
   });
   tokio_util::run(main_future);
 }
 
 fn run_script(flags: DenoFlags, argv: Vec<String>) {
+  let use_current_thread = flags.current_thread;
   let (mut worker, state) = create_worker_and_state(flags, argv);
 
   let main_module = state.main_module().unwrap();
@@ -345,9 +356,15 @@ fn run_script(flags: DenoFlags, argv: Vec<String>) {
           js_check(result);
           Ok(())
         })
-      }).map_err(print_err_and_exit)
+      })
+      .map_err(print_err_and_exit)
   });
-  tokio_util::run(main_future);
+
+  if use_current_thread {
+    tokio_util::run_on_current_thread(main_future);
+  } else {
+    tokio_util::run(main_future);
+  }
 }
 
 fn main() {

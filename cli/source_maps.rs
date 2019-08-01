@@ -17,9 +17,9 @@ pub trait SourceMapGetter {
 
 /// Cached filename lookups. The key can be None if a previous lookup failed to
 /// find a SourceMap.
-type CachedMaps = HashMap<String, Option<SourceMap>>;
+pub type CachedMaps = HashMap<String, Option<SourceMap>>;
 
-struct SourceMap {
+pub struct SourceMap {
   mappings: Mappings,
   sources: Vec<String>,
 }
@@ -78,13 +78,15 @@ fn builtin_source_map(script_name: &str) -> Option<Vec<u8>> {
       include_bytes!(concat!(
         env!("GN_OUT_DIR"),
         "/gen/cli/bundle/main.js.map"
-      )).to_vec(),
+      ))
+      .to_vec(),
     ),
     "gen/cli/bundle/compiler.js" => Some(
       include_bytes!(concat!(
         env!("GN_OUT_DIR"),
         "/gen/cli/bundle/compiler.js.map"
-      )).to_vec(),
+      ))
+      .to_vec(),
     ),
     _ => None,
   }
@@ -202,7 +204,7 @@ fn get_maybe_orig_position<G: SourceMapGetter>(
   }
 }
 
-fn get_orig_position<G: SourceMapGetter>(
+pub fn get_orig_position<G: SourceMapGetter>(
   script_name: String,
   line: i64,
   column: i64,

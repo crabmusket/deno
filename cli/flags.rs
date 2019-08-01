@@ -1,11 +1,11 @@
 // Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
+use crate::fs as deno_fs;
 use clap::App;
 use clap::AppSettings;
 use clap::Arg;
 use clap::ArgMatches;
 use clap::Shell;
 use clap::SubCommand;
-use crate::fs as deno_fs;
 use deno::ModuleSpecifier;
 use log::Level;
 use std;
@@ -43,6 +43,8 @@ pub struct DenoFlags {
   pub v8_flags: Option<Vec<String>>,
   pub xeval_replvar: Option<String>,
   pub xeval_delim: Option<String>,
+  // Use tokio::runtime::current_thread
+  pub current_thread: bool,
 }
 
 static ENV_VARIABLES_HELP: &str = "ENVIRONMENT VARIABLES:
@@ -59,7 +61,8 @@ fn add_run_args<'a, 'b>(app: App<'a, 'b>) -> App<'a, 'b> {
         .use_delimiter(true)
         .require_equals(true)
         .help("Allow file system read access"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("allow-write")
         .long("allow-write")
         .min_values(0)
@@ -67,7 +70,8 @@ fn add_run_args<'a, 'b>(app: App<'a, 'b>) -> App<'a, 'b> {
         .use_delimiter(true)
         .require_equals(true)
         .help("Allow file system write access"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("allow-net")
         .long("allow-net")
         .min_values(0)
@@ -75,49 +79,45 @@ fn add_run_args<'a, 'b>(app: App<'a, 'b>) -> App<'a, 'b> {
         .use_delimiter(true)
         .require_equals(true)
         .help("Allow network access"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("allow-env")
         .long("allow-env")
         .help("Allow environment access"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("allow-run")
         .long("allow-run")
         .help("Allow running subprocesses"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("allow-hrtime")
         .long("allow-hrtime")
         .help("Allow high resolution time measurement"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("allow-all")
         .short("A")
         .long("allow-all")
         .help("Allow all permissions"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("no-prompt")
         .long("no-prompt")
         .help("Do not use prompts"),
-    ).arg(
+    )
+    .arg(
       Arg::with_name("no-fetch")
         .long("no-fetch")
         .help("Do not download remote modules"),
-    ).arg(
-      Arg::with_name("importmap")
-        .long("importmap")
-        .value_name("FILE")
-        .help("Load import map file")
-        .long_help(
-          "Load import map file
-Specification: https://wicg.github.io/import-maps/
-Examples: https://github.com/WICG/import-maps#the-import-map",
-        ).takes_value(true),
     )
 }
 
 pub fn create_cli_app<'a, 'b>() -> App<'a, 'b> {
   add_run_args(App::new("deno"))
     .bin_name("deno")
-    .global_settings(&[AppSettings::ColorNever])
-    .settings(&[AppSettings::DisableVersion, AppSettings::AllowExternalSubcommands])
+    .global_settings(&[AppSettings::ColorNever, AppSettings::UnifiedHelpMessage, AppSettings::DisableVersion])
+    .settings(&[AppSettings::AllowExternalSubcommands])
     .after_help(ENV_VARIABLES_HELP)
     .long_about("A secure runtime for JavaScript and TypeScript built with V8, Rust, and Tokio.
 
@@ -141,6 +141,12 @@ To get help on the another subcommands (run in this case):
 
   deno help run")
     .arg(
+      Arg::with_name("version")
+        .short("v")
+        .long("version")
+        .help("Print the version"),
+    )
+    .arg(
       Arg::with_name("log-level")
         .short("L")
         .long("log-level")
@@ -160,6 +166,24 @@ To get help on the another subcommands (run in this case):
         .long("config")
         .value_name("FILE")
         .help("Load compiler configuration file")
+        .takes_value(true)
+        .global(true),
+    )
+    .arg(
+      Arg::with_name("current-thread")
+        .long("current-thread")
+        .global(true)
+        .help("Use tokio::runtime::current_thread"),
+    ).arg(
+      Arg::with_name("importmap")
+        .long("importmap")
+        .value_name("FILE")
+        .help("Load import map file")
+        .long_help(
+          "Load import map file
+Specification: https://wicg.github.io/import-maps/
+Examples: https://github.com/WICG/import-maps#the-import-map",
+        )
         .takes_value(true)
         .global(true),
     ).arg(
@@ -190,7 +214,6 @@ To get help on the another subcommands (run in this case):
         .global(true),
     ).subcommand(
       SubCommand::with_name("version")
-        .setting(AppSettings::DisableVersion)
         .about("Print the version")
         .long_about("Print current version of Deno.
 
@@ -199,7 +222,6 @@ compiler.",
         ),
     ).subcommand(
       SubCommand::with_name("bundle")
-        .setting(AppSettings::DisableVersion)
         .about("Bundle module and dependencies into single file")
         .long_about(
           "Output a single JavaScript file with all dependencies
@@ -212,7 +234,6 @@ Example:
           .arg(Arg::with_name("out_file").takes_value(true).required(false)),
     ).subcommand(
       SubCommand::with_name("fetch")
-        .setting(AppSettings::DisableVersion)
         .about("Fetch the dependencies")
         .long_about(
           "Fetch and compile remote dependencies recursively.
@@ -229,7 +250,6 @@ would be made unless --reload is specified.
         ).arg(Arg::with_name("file").takes_value(true).required(true)),
     ).subcommand(
       SubCommand::with_name("types")
-        .setting(AppSettings::DisableVersion)
         .about("Print runtime TypeScript declarations")
         .long_about("Print runtime TypeScript declarations.
 
@@ -239,7 +259,6 @@ The declaration file could be saved and used for typing information.",
         ),
     ).subcommand(
       SubCommand::with_name("info")
-        .setting(AppSettings::DisableVersion)
         .about("Show source file related info")
         .long_about("Show source file related info.
 
@@ -255,7 +274,6 @@ The following information is shown:
         ).arg(Arg::with_name("file").takes_value(true).required(true)),
     ).subcommand(
       SubCommand::with_name("eval")
-        .setting(AppSettings::DisableVersion)
         .about("Eval script")
         .long_about(
           "Evaluate provided script.
@@ -266,7 +284,6 @@ This command has implicit access to all permissions (equivalent to deno run --al
         ).arg(Arg::with_name("code").takes_value(true).required(true)),
     ).subcommand(
       SubCommand::with_name("fmt")
-        .setting(AppSettings::DisableVersion)
         .about("Format files")
         .long_about(
 "Auto-format JavaScript/TypeScript source code using Prettier
@@ -290,7 +307,6 @@ Automatically downloads Prettier dependencies on first run.
         .settings(&[
           AppSettings::AllowExternalSubcommands,
           AppSettings::DisableHelpSubcommand,
-          AppSettings::DisableVersion,
           AppSettings::SubcommandRequired,
         ]).about("Run a program given a filename or url to the source code")
         .long_about(
@@ -317,7 +333,6 @@ ability to spawn subprocesses.
         ),
     ).subcommand(
     SubCommand::with_name("xeval")
-        .setting(AppSettings::DisableVersion)
         .about("Eval a script on text segments from stdin")
         .long_about(
           "Eval a script on lines from stdin
@@ -357,7 +372,6 @@ Demonstrates breaking the input up by space delimiter instead of by lines:
     ).subcommand(
       SubCommand::with_name("install")
         .settings(&[
-          AppSettings::DisableVersion,
           AppSettings::DisableHelpSubcommand,
           AppSettings::AllowExternalSubcommands,
           AppSettings::SubcommandRequired,
@@ -395,7 +409,6 @@ To change installation directory use -d/--dir flag
       SubCommand::with_name("completions")
         .settings(&[
           AppSettings::DisableHelpSubcommand,
-          AppSettings::DisableVersion,
         ]).about("Generate shell completions")
         .long_about(
 "Output shell completion script to standard output.
@@ -446,6 +459,9 @@ pub fn parse_flags(
 ) -> DenoFlags {
   let mut flags = maybe_flags.unwrap_or_default();
 
+  if matches.is_present("current-thread") {
+    flags.current_thread = true;
+  }
   if matches.is_present("log-level") {
     flags.log_level = match matches.value_of("log-level").unwrap() {
       "debug" => Some(Level::Debug),
@@ -670,6 +686,10 @@ pub fn flags_from_vec(
   let mut argv: Vec<String> = vec!["deno".to_string()];
   let mut flags = parse_flags(&matches.clone(), None);
 
+  if flags.version {
+    return (flags, DenoSubcommand::Version, argv);
+  }
+
   let subcommand = match matches.subcommand() {
     ("bundle", Some(bundle_match)) => {
       flags.allow_write = true;
@@ -805,7 +825,6 @@ pub fn flags_from_vec(
       argv.extend(vec![code.to_string()]);
       DenoSubcommand::Xeval
     }
-    ("version", Some(_)) => DenoSubcommand::Version,
     (script, Some(script_match)) => {
       argv.extend(vec![script.to_string()]);
       // check if there are any extra arguments that should
@@ -844,6 +863,28 @@ mod tests {
   #[test]
   fn test_flags_from_vec_1() {
     let (flags, subcommand, argv) = flags_from_vec(svec!["deno", "version"]);
+    assert_eq!(
+      flags,
+      DenoFlags {
+        version: true,
+        ..DenoFlags::default()
+      }
+    );
+    assert_eq!(subcommand, DenoSubcommand::Version);
+    assert_eq!(argv, svec!["deno"]);
+
+    let (flags, subcommand, argv) = flags_from_vec(svec!["deno", "--version"]);
+    assert_eq!(
+      flags,
+      DenoFlags {
+        version: true,
+        ..DenoFlags::default()
+      }
+    );
+    assert_eq!(subcommand, DenoSubcommand::Version);
+    assert_eq!(argv, svec!["deno"]);
+
+    let (flags, subcommand, argv) = flags_from_vec(svec!["deno", "-v"]);
     assert_eq!(
       flags,
       DenoFlags {
@@ -1348,6 +1389,22 @@ mod tests {
     );
     assert_eq!(subcommand, DenoSubcommand::Run);
     assert_eq!(argv, svec!["deno", "script.ts"]);
+
+    let (flags, subcommand, argv) = flags_from_vec(svec![
+      "deno",
+      "fetch",
+      "--importmap=importmap.json",
+      "script.ts"
+    ]);
+    assert_eq!(
+      flags,
+      DenoFlags {
+        import_map_path: Some("importmap.json".to_owned()),
+        ..DenoFlags::default()
+      }
+    );
+    assert_eq!(subcommand, DenoSubcommand::Fetch);
+    assert_eq!(argv, svec!["deno", "script.ts"]);
   }
 
   #[test]
@@ -1576,6 +1633,21 @@ mod tests {
       flags,
       DenoFlags {
         no_fetch: true,
+        ..DenoFlags::default()
+      }
+    );
+    assert_eq!(subcommand, DenoSubcommand::Run);
+    assert_eq!(argv, svec!["deno", "script.ts"])
+  }
+
+  #[test]
+  fn test_flags_from_vec_35() {
+    let (flags, subcommand, argv) =
+      flags_from_vec(svec!["deno", "--current-thread", "script.ts"]);
+    assert_eq!(
+      flags,
+      DenoFlags {
+        current_thread: true,
         ..DenoFlags::default()
       }
     );
